@@ -18,7 +18,7 @@ allowed-tools:
 
 运行重置脚本:
 
-!`python "$CLAUDE_PROJECT_DIR/.claude/hooks/new_analysis.py"`
+!`python .claude/hooks/new_analysis.py`
 
 ## 重置完成后
 
