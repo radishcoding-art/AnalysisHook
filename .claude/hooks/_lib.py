@@ -182,17 +182,12 @@ def read_stdin_json():
     """
     读 hook 的 stdin JSON.
     失败时返回 {} (不阻塞 hook).
-
-    第四轮 P1-C 说明: 这个函数在 parse 失败时返回 {}, 对 stop / session_start 等
-    "只读注入" 类 hook 是 OK 的. 但对 PreToolUse 这种 "决定要不要放行" 类 hook,
-    parse 失败 + 返回 {} 会让下游误判 "空输入 → 放行" (Fail Open).
-    PreToolUse 应该用 `read_stdin_json_strict()` 强制 Fail Closed.
     """
     try:
-        text = sys.stdin.read()
-        if not text.strip():
+        raw = sys.stdin.buffer.read()
+        if not raw.strip():
             return {}
-        return json.loads(text)
+        return json.loads(raw.decode("utf-8"))
     except Exception as e:
         log("failed to read stdin JSON: {0}".format(e), "_lib")
         return {}
@@ -201,12 +196,12 @@ def read_stdin_json():
 def read_stdin_json_strict():
     """
     严格版 stdin JSON reader. parse 失败直接抛异常, 不 silent-swallow.
-    第四轮 P1-C 修复: PreToolUse hook 用这个, 保证 Fail Closed.
+    PreToolUse hook 用这个, 保证 Fail Closed.
     """
-    text = sys.stdin.read()
-    if not text.strip():
+    raw = sys.stdin.buffer.read()
+    if not raw.strip():
         return {}
-    return json.loads(text)
+    return json.loads(raw.decode("utf-8"))
 
 
 # ============================================================
