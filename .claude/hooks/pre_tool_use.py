@@ -83,6 +83,13 @@ def main():
     if not check_config_file_protection(tool_name, tool_input):
         return
 
+    # ============ 检查 0.5: 禁止静默切换 plan.md current_step ============
+    # 配合 Stop hook L7 (方案切换证据要求), 提前到 PreToolUse 层拦截.
+    # 规则: Edit/Write/MultiEdit 改 plan.md 时, 如果 current_step 从 A 变为 B (A != B 且 A 非空),
+    # post-edit 内容里 A 的 status 必须是 completed 或 failed. 否则 = 静默切换, block.
+    if not check_plan_switch_evidence(tool_name, tool_input):
+        return
+
     # ============ 检查 1: 任务理解锁 ============
     # task_understanding_acked=false → 任何关键 tool call 都拒绝
     if is_critical(tool_name):
@@ -633,6 +640,162 @@ def _is_field_flipped_to_true(current_value, post_value):
         return s in ("true", "yes", "1", "on", "y")
 
     return is_truthy(post_value) and not is_truthy(current_value)
+
+
+def check_plan_switch_evidence(tool_name, tool_input):
+    """
+    拦截 "silent switch": 改 plan.md 的 current_step 但旧 step 未正式收尾.
+
+    配合 Stop hook L7 (方案切换证据要求) 形成双层防御:
+    - L7 抓"在文本里声明切换" (回合末)
+    - 本检查抓"通过改 plan.md current_step 静默切换" (PreToolUse 前置拦截)
+
+    规则:
+    - 仅对 Edit / Write / MultiEdit 且目标是 plan.md 生效
+    - 如果 post-edit 的 current_step != pre-edit 的 current_step, 且 pre 非空 (不是首次设置)
+    - 那么 pre 对应的 step 在 post-edit 内容里的 status 必须是 completed 或 failed
+    - 否则 = 静默跳过未完成 step → block
+
+    合法案例 (放行):
+    - 首次设置 current_step (pre=null → post=S001)
+    - 同一次 MultiEdit 里原子地把 S001 status=failed/completed + current_step=S002
+    - current_step 不变 (只改其他字段)
+
+    非法案例 (block):
+    - S001 status 还是 active, 却把 current_step 改成 S002 (没收尾就跳)
+    - current_step: S001 → null, 且 S001 status 还是 active (想"暂停"逃避)
+    """
+    if tool_name not in ("Edit", "Write", "MultiEdit"):
+        return True
+
+    file_path = tool_input.get("file_path") or tool_input.get("path") or ""
+    if not file_path:
+        return True
+
+    # 只对 plan.md 生效 (段级匹配, 防 my-plan.md 误伤)
+    norm = _normalize_path(file_path)
+    plan_suffixes = (".claude/state/plan.md", "claude/state/plan.md")
+    if not (
+        norm == "claude/state/plan.md"
+        or any(norm.endswith("/" + s) for s in plan_suffixes)
+    ):
+        return True
+
+    # 读 pre 内容
+    try:
+        fp = Path(file_path)
+        pre_content = fp.read_text(encoding="utf-8") if fp.exists() else ""
+    except Exception as e:
+        log("check_plan_switch: failed to read pre content: {0}".format(e), HOOK_NAME)
+        return True  # 读不到就不拦 (避免 hook 自身 bug 卡死)
+
+    pre_current, pre_ok = _extract_yaml_field_value(pre_content, "current_step")
+    if not pre_ok:
+        # frontmatter 损坏, 让其他检查处理
+        log("check_plan_switch: pre frontmatter parse failed, skipping", HOOK_NAME)
+        return True
+
+    # 模拟 edit 后的内容
+    post_content = _simulate_edit_and_get_result(file_path, tool_name, tool_input)
+    if post_content is None:
+        return True
+
+    post_current, post_ok = _extract_yaml_field_value(post_content, "current_step")
+    if not post_ok:
+        # AI 改完 frontmatter 就坏了, 让 Edit 正常执行 → 其他检查会暴露
+        return True
+
+    def norm_step_id(value):
+        if value is None:
+            return None
+        s = str(value).strip().strip('"').strip("'")
+        if s.lower() in ("null", "none", ""):
+            return None
+        return s
+
+    pre_id = norm_step_id(pre_current)
+    post_id = norm_step_id(post_current)
+
+    # 放行情况 1: pre 为空 (首次设置 current_step)
+    if pre_id is None:
+        return True
+
+    # 放行情况 2: current_step 没变化
+    if pre_id == post_id:
+        return True
+
+    # 改 / 清空 current_step, pre 非空 → 检查 pre step 是否正式收尾
+    pre_step_status = _extract_step_status(post_content, pre_id)
+
+    if pre_step_status in ("completed", "failed"):
+        # 合法收尾 → 放行
+        log(
+            "check_plan_switch: current_step {0} -> {1}, old step status={2}, allowed".format(
+                pre_id, post_id or "null", pre_step_status
+            ),
+            HOOK_NAME,
+        )
+        return True
+
+    # 静默切换 → block
+    post_display = post_id if post_id else "(null/空)"
+    status_display = pre_step_status if pre_step_status else "(未在 post 内容里修改)"
+    reason_lines = [
+        "拒绝: 尝试切换 plan.md 的 `current_step` 但旧 step 未正式收尾 (静默切换).",
+        "",
+        "**检测到**:",
+        "- pre  `current_step`: `{0}`".format(pre_id),
+        "- post `current_step`: `{0}`".format(post_display),
+        "- `{0}` 在 post-edit 内容里 status=`{1}`".format(pre_id, status_display),
+        "",
+        "**规则 (配合 Stop hook L7)**: 切换 current_step 前, 旧 step 的 status 必须先改成 `completed` 或 `failed`.",
+        "- `completed` = 有 F<id> 证据验证通过, 填 `result_facts`",
+        "- `failed`    = 有 F<id> 证据证伪, 填 `failed_reason`, 同时必须写入 `dead_ends.md`",
+        "",
+        "**为什么**: 不收尾就切换 step = 沉没成本逃避 / 情绪化换方向. 长期会让 plan.md 堆满 active 但被放弃的 step.",
+        "",
+        "**修复 (推荐原子 MultiEdit)**:",
+        "用一次 `MultiEdit` 同时改两处, hook 只看 post 状态, 合法即放行:",
+        "  1. `steps[]` 里 `{0}` 的 status: `active` → `completed` / `failed` (+ 相应字段)".format(
+            pre_id
+        ),
+        "  2. frontmatter `current_step`: `{0}` → `{1}`".format(pre_id, post_display),
+        "",
+        "如果旧 step 还没走完只是想暂时探路, **不要改 current_step**, 在 plan.md 正文写 exploration 笔记, 保持 current_step 不变.",
+        "",
+        "如果旧 step 真的证伪了, 记得同时 append 一条到 `.claude/state/dead_ends.md` (这是 template 强制的).",
+    ]
+    block("\n".join(reason_lines))
+    return False
+
+
+def _extract_step_status(plan_content, step_id):
+    """
+    从 plan.md frontmatter 的 steps[] 列表里找 id == step_id 的 step, 返回其 status (lowercase).
+    找不到或解析失败 → None.
+    """
+    if not plan_content or not step_id:
+        return None
+    try:
+        fm, _ = split_frontmatter(plan_content)
+    except Exception:
+        return None
+    if not isinstance(fm, dict):
+        return None
+    steps = fm.get("steps") or []
+    if not isinstance(steps, list):
+        return None
+    target = str(step_id).strip()
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        sid = str(step.get("id", "")).strip().strip('"').strip("'")
+        if sid == target:
+            status = step.get("status")
+            if status is None:
+                return None
+            return str(status).strip().lower()
+    return None
 
 
 def check_task_understanding_acked(tool_name):

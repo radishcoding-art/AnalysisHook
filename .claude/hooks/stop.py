@@ -121,6 +121,24 @@ def main():
         block(reason)
         return
 
+    # ============ L6: 计算强制验证 ============
+    ok, reason = check_l6_arithmetic_verification(last_text, transcript_path, config)
+    if not ok:
+        block(reason)
+        return
+
+    # ============ L7: 禁止未证伪就切换方向 ============
+    ok, reason = check_l7_approach_switch(last_text, transcript_path, config)
+    if not ok:
+        block(reason)
+        return
+
+    # ============ L8: 禁止 AI 自发停止 ============
+    ok, reason = check_l8_self_stop(last_text, transcript_path, config)
+    if not ok:
+        block(reason)
+        return
+
     # ============ tool call 阈值检查 (软警告, 不 block) ============
     threshold_warning = check_tool_call_threshold(
         transcript_path, facts_content, config
@@ -659,7 +677,7 @@ def has_valid_self_review_header(text, required_sections):
     return False
 
 
-def check_self_review_content(text):
+def check_self_review_content(text, require_reviewer=True):
     """
     验证自证段**内容**完整, 不只查 header.
 
@@ -668,7 +686,7 @@ def check_self_review_content(text):
     - 结论 (一句话)
     - 依据的 facts (F<id> 清单)
     - 自我检查 4 项 (上下文偏见 / sunk cost / 逻辑漏洞 / 确认偏见)
-    - 独立审查 (reviewer 返回)
+    - 独立审查 (reviewer 返回) — 仅当 require_reviewer=True 时强制
 
     返回 (ok, missing_list). ok=True 时 missing=[], 否则 missing 是缺失标签.
     """
@@ -707,8 +725,14 @@ def check_self_review_content(text):
             r"逻辑漏洞",
             r"确认偏见",
         ],
-        "独立审查": [r"独立审查", r"Independent Review", r"Reviewer", r"code-reviewer"],
     }
+    if require_reviewer:
+        required_keywords["独立审查"] = [
+            r"独立审查",
+            r"Independent Review",
+            r"Reviewer",
+            r"code-reviewer",
+        ]
     missing = []
     for label, patterns in required_keywords.items():
         found = any(re.search(p, body, re.IGNORECASE) for p in patterns)
@@ -727,11 +751,15 @@ def check_l5_self_review(text, transcript_path, config):
     """
     L5: 如果回复含 "结论声明触发词", 必须:
         (a) 回复含自证段 (markdown header 之一, line-anchored)
-        (b) 本回合 transcript 含 Agent 工具调用 + subagent_type 在白名单
+        (b) 自证段正文含 结论 / 依据 / 自我检查 (require_reviewer_call=true 时还要 独立审查)
+        (c) require_reviewer_call=true 时, 本回合 transcript 含合法 reviewer Agent 调用
 
     任一缺失 → block.
 
     触发词匹配先 strip 代码块 + 规范化全角标点, 防 AI 绕过.
+
+    config flag `require_reviewer_call` (默认 true) 控制是否强制 reviewer 调用.
+    设为 false 时, L5 只要求自证段三段 (结论 / 依据 / 自我检查), 不要求外部 reviewer.
     """
     check_config = config.get("conclusion_self_review_check") or {}
     if not isinstance(check_config, dict):
@@ -741,7 +769,7 @@ def check_l5_self_review(text, transcript_path, config):
 
     triggers = check_config.get("trigger_phrases") or []
     required_sections = check_config.get("required_self_review_sections") or []
-    # 精确白名单 (P0-4 修复), 替代子串匹配
+    require_reviewer_call = bool(check_config.get("require_reviewer_call", True))
     allowed_reviewers = check_config.get("allowed_reviewer_subagents") or [
         "superpowers:code-reviewer",
         "code-reviewer",
@@ -767,6 +795,9 @@ def check_l5_self_review(text, transcript_path, config):
     # P1-4 修复: 用 line-anchored regex 避免引号 / 段落中间的 "## 自证" 字符串
     has_self_review_section = has_valid_self_review_header(stripped, required_sections)
     if not has_self_review_section:
+        sub_items_4 = "4. **独立审查**: 调用 `superpowers:code-reviewer` 的结果\n\n"
+        if not require_reviewer_call:
+            sub_items_4 = ""
         return False, (
             "**Stop hook L5 violation**: 回复含结论声明, 但缺少自证段.\n\n"
             "**触发的声明词**: {0}\n\n"
@@ -778,24 +809,35 @@ def check_l5_self_review(text, transcript_path, config):
             "1. **结论**: 一句话复述\n"
             "2. **依据的 facts**: 列出 F<id>\n"
             "3. **自我检查**: 上下文偏见 / sunk cost / 逻辑漏洞 / 确认偏见 4 项\n"
-            "4. **独立审查**: 调用 `superpowers:code-reviewer` 的结果\n\n"
-            "详细格式见 CLAUDE.md '结论自证与独立审查' 章节."
-        ).format(", ".join(triggered[:3]))
+            "{1}"
+            "详细格式见 CLAUDE.md '结论自证' 章节."
+        ).format(", ".join(triggered[:3]), sub_items_4)
 
     # 自证段 header 在, 进一步校验内容 (防空自证偷懒)
-    content_ok, missing = check_self_review_content(stripped)
+    content_ok, missing = check_self_review_content(
+        stripped, require_reviewer=require_reviewer_call
+    )
     if not content_ok:
+        sub_items_4 = (
+            "4. **独立审查**: 调用 `superpowers:code-reviewer` 并 quote 它的返回\n\n"
+        )
+        if not require_reviewer_call:
+            sub_items_4 = ""
         return False, (
             "**Stop hook L5 violation**: 自证段 header 存在但内容不完整.\n\n"
             "**触发的声明词**: {0}\n\n"
             "**缺失项**: {1}\n\n"
-            "**修复**: 自证段必须含 4 个子段, 每段有实质内容 (不是空 header):\n"
+            "**修复**: 自证段必须含以下子段, 每段有实质内容 (不是空 header):\n"
             "1. **结论**: 一句话复述当前结论\n"
             "2. **依据 (facts)**: 列出支持结论的 F<id> 清单\n"
             "3. **自我检查**: 回答 4 个问题 - 上下文偏见 / sunk cost / 逻辑漏洞 / 确认偏见\n"
-            "4. **独立审查**: 调用 `superpowers:code-reviewer` 并 quote 它的返回\n\n"
-            "整段正文最少 100 字符. 详细格式见 CLAUDE.md '结论自证与独立审查' 章节."
-        ).format(", ".join(triggered[:3]), ", ".join(missing))
+            "{2}"
+            "整段正文最少 100 字符. 详细格式见 CLAUDE.md '结论自证' 章节."
+        ).format(", ".join(triggered[:3]), ", ".join(missing), sub_items_4)
+
+    # require_reviewer_call=False → 跳过 reviewer 调用检查, 直接通过
+    if not require_reviewer_call:
+        return True, None
 
     # 有自证段, 必须有 reviewer 调用
     has_reviewer_call = check_transcript_for_agent_call(
@@ -910,6 +952,569 @@ def check_transcript_for_agent_call(transcript_path, allowed_reviewers):
                     return True
 
     return False
+
+
+# ============================================================
+# L6: 计算强制验证
+# ============================================================
+
+
+def check_l6_arithmetic_verification(text, transcript_path, config):
+    """
+    L6: 回复含算术痕迹 (数字运算表达式 / 结果声明词), 但本回合未调用 python → block.
+
+    为什么: 心算 / 手算错误无法自查. 唯一可验证的路径是 python 执行 → 结果粘回回复.
+    触发词和 python 模式都从 CLAUDE.md arithmetic_verification_check 配置读.
+
+    豁免:
+    - 代码块 (``` 和 行内 `) 由 strip_code_blocks 去除
+    - 引用行 (> 开头) 在本函数里过滤, 避免引用用户原话里的数字触发
+    """
+    check_config = config.get("arithmetic_verification_check") or {}
+    if not isinstance(check_config, dict):
+        return True, None
+    if not check_config.get("enabled", True):
+        return True, None
+
+    arith_patterns = check_config.get("arithmetic_patterns") or []
+    result_triggers = check_config.get("result_claim_triggers") or []
+    python_patterns = check_config.get("python_bash_patterns") or [r"\bpython\b"]
+
+    if not arith_patterns and not result_triggers:
+        return True, None
+
+    stripped = strip_code_blocks(text)
+    cleaned = "\n".join(
+        ln for ln in stripped.split("\n") if not ln.strip().startswith(">")
+    )
+
+    hits = []
+    for pat in list(arith_patterns) + list(result_triggers):
+        if not pat:
+            continue
+        try:
+            m = re.search(pat, cleaned, re.IGNORECASE)
+            if m:
+                hits.append((pat, m.group(0)))
+        except re.error as e:
+            log("L6 regex compile error for `{0}`: {1}".format(pat, e), HOOK_NAME)
+            continue
+
+    if not hits:
+        return True, None
+
+    if check_transcript_for_python_bash(transcript_path, python_patterns):
+        return True, None
+
+    sample = "\n".join(
+        "  - pattern `{0}` -> match `{1}`".format(p, str(x)[:80]) for p, x in hits[:3]
+    )
+    return False, (
+        "**Stop hook L6 violation**: 回复中含数字运算痕迹, 但本回合未调用 python 验证.\n\n"
+        "**命中的痕迹**:\n{0}\n\n"
+        "**修复**: 任何数字运算 (加减乘除 / 位运算 / 地址偏移 / 字节长度 / 进制转换 / "
+        '百分比 / 时间换算) 必须用 `Bash(python -c "...")` 执行一次, 把 python 输出'
+        "贴回回复, 再写结论. 禁止直接写心算 / 手算结果.\n\n"
+        "**为什么**: 心算错误无法自查, CLAUDE.md 已明确要求 python 验证. 如果这是误报 "
+        "(例如引用用户给的数字 / 版本号 / 路径里的数字), 把数字放进 ``` 代码块或行内 "
+        "`` ` `` 或在句前加 `>` 引用标记, L6 会自动豁免."
+    ).format(sample)
+
+
+def check_transcript_for_python_bash(transcript_path, python_patterns):
+    """
+    本回合是否有 Bash tool_use 且 command 匹配任一 python_pattern.
+    结构参考 check_transcript_for_agent_call: 倒序遍历到上一 user role 为止, 只读最后 512KB.
+    """
+    if not transcript_path:
+        return False
+    p = Path(transcript_path)
+    if not p.exists():
+        return False
+
+    compiled = []
+    for pat in python_patterns:
+        if not pat:
+            continue
+        try:
+            compiled.append(re.compile(pat, re.IGNORECASE))
+        except re.error:
+            continue
+    if not compiled:
+        return False
+
+    try:
+        file_size = p.stat().st_size
+        if file_size > 512 * 1024:
+            with p.open("rb") as f:
+                f.seek(-512 * 1024, 2)
+                f.readline()
+                raw = f.read()
+            text = raw.decode("utf-8", errors="ignore")
+        else:
+            text = p.read_text(encoding="utf-8")
+    except Exception as e:
+        log("L6 failed to read transcript: {0}".format(e), HOOK_NAME)
+        return False
+
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+
+        role = event.get("role") or event.get("type") or ""
+        inner = event.get("message")
+        if isinstance(inner, dict) and not role:
+            role = inner.get("role") or inner.get("type") or ""
+        if role in ("user", "human"):
+            break
+
+        content = event.get("content")
+        if content is None and isinstance(inner, dict):
+            content = inner.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "tool_use":
+                continue
+            if str(item.get("name", "") or "") != "Bash":
+                continue
+            input_obj = item.get("input", {}) or {}
+            if not isinstance(input_obj, dict):
+                continue
+            command = str(input_obj.get("command", "") or "")
+            if any(r.search(command) for r in compiled):
+                return True
+
+    return False
+
+
+# ============================================================
+# L7: 禁止未证伪就切换方向
+# ============================================================
+
+
+def check_l7_approach_switch(text, transcript_path, config):
+    """
+    L7: 回复含"切换意图"短语, 但没有证据 (未写 dead_ends / 无评估段 / 无 user-told) → block.
+
+    豁免: 代码块 / 行内 code / `>` 引用行自动跳过 (复用 strip_code_blocks).
+    句首含 exemption_prefixes (头脑风暴 / 讨论 / ...) 的行跳过.
+
+    通过条件 (任一满足):
+    1. 本回合写入 dead_ends_path (Edit / Write / MultiEdit)
+    2. 回复含 required_section_headers 之一 + 正文 >= min_section_body_length + 至少 1 个 F<id>
+    3. 回复含 "user-told:" cite
+    """
+    check_config = config.get("approach_switch_check") or {}
+    if not isinstance(check_config, dict):
+        return True, None
+    if not check_config.get("enabled", True):
+        return True, None
+
+    triggers = check_config.get("trigger_phrases") or []
+    exemption_prefixes = check_config.get("exemption_prefixes") or []
+    dead_ends_path = check_config.get("dead_ends_path", ".claude/state/dead_ends.md")
+    required_headers = check_config.get("required_section_headers") or [
+        "## 方案切换评估"
+    ]
+    min_body_len = int(check_config.get("min_section_body_length", 100))
+
+    if not triggers:
+        return True, None
+
+    stripped = strip_code_blocks(text)
+    # 过滤引用行 + 豁免前缀行
+    kept_lines = []
+    for line in stripped.split("\n"):
+        s = line.strip()
+        if s.startswith(">"):
+            continue
+        # 豁免前缀 (句首匹配)
+        # 先剥离 markdown list 标记 / 格式符 (参考 is_action_sentence)
+        cleaned = re.sub(r"^(?:\s*(?:[-*+]|\d+[.)])\s+)+", "", s)
+        cleaned = re.sub(r"^[\s*_#`>]+", "", cleaned).lstrip()
+        if any(prefix and cleaned.startswith(prefix) for prefix in exemption_prefixes):
+            continue
+        kept_lines.append(line)
+    cleaned_text = "\n".join(kept_lines)
+
+    # 找触发词
+    triggered = []
+    for pat in triggers:
+        if not pat:
+            continue
+        try:
+            m = re.search(pat, cleaned_text, re.UNICODE)
+            if m:
+                triggered.append((pat, m.group(0)))
+        except re.error as e:
+            log("L7 regex compile error for `{0}`: {1}".format(pat, e), HOOK_NAME)
+            continue
+
+    if not triggered:
+        return True, None
+
+    # 通过条件 1: 本回合写入 dead_ends
+    wrote_dead_ends = check_transcript_for_file_edit(transcript_path, dead_ends_path)
+
+    # 通过条件 2: 有评估段 + 内容 + cite
+    has_valid_section = _l7_has_valid_switch_section(
+        stripped, required_headers, min_body_len
+    )
+
+    # 通过条件 3: user-told cite
+    has_user_told = bool(re.search(r"user-told\s*:", stripped, re.IGNORECASE))
+
+    if wrote_dead_ends or has_valid_section or has_user_told:
+        return True, None
+
+    sample = "\n".join(
+        "  - pattern `{0}` -> match `{1}`".format(p, str(m)[:60])
+        for p, m in triggered[:3]
+    )
+    return False, (
+        "**Stop hook L7 violation**: 回复含切换方案意图, 但未提供证据.\n\n"
+        "**命中的切换短语**:\n{0}\n\n"
+        "**为什么 block**: 当前方案没有 fact 证明不可行就想切换, 属于 sunk-cost 逃避 / "
+        "情绪化决策. 类比 (像 F<id> 一样) 不等于证据.\n\n"
+        "**修复 (任选其一)**:\n\n"
+        "(a) **证伪当前路径**: 在 `.claude/state/dead_ends.md` 写一条 D<id>, 用 fact "
+        "(F<id>) 说明当前路径无法达成 task_goal. 本回合的 Edit/Write/MultiEdit 命中 "
+        "dead_ends.md 即放行.\n\n"
+        "(b) **写方案切换评估段**: 在回复末尾加 `## 方案切换评估` section, 正文包含:\n"
+        "  - **当前方案**: 一句话\n"
+        "  - **已完成验证**: F<id> 列表\n"
+        "  - **剩余未验证步骤**: 列出 + 为什么不可行 (cite F<id>)\n"
+        "  - **新方向**: 预期证据 + 怎么验证\n"
+        "  正文 >= {1} 字符, 必须至少 1 个 F<id> cite.\n\n"
+        "(c) **用户授权**: 如果用户已授权切换, cite `user-told: <用户原话>`.\n\n"
+        "**豁免**: 如果这只是头脑风暴 / 讨论多方案 (不是真要切换), 句首加 `头脑风暴` / "
+        "`讨论` / `考虑` / `比较` / `权衡` 等前缀, L7 自动跳过."
+    ).format(sample, min_body_len)
+
+
+def _l7_has_valid_switch_section(text, required_headers, min_body_len):
+    """
+    检查文本含 "## 方案切换评估" header + 正文合法.
+
+    合法 = 正文 >= min_body_len 字符 (去掉 header 后) + 至少 1 个 F\\d{3,} cite.
+    """
+    if not text:
+        return False
+
+    start = -1
+    for header in required_headers:
+        if not header:
+            continue
+        try:
+            # line-anchored, 允许 header 后有额外文字
+            pattern = re.compile(
+                r"^" + re.escape(header) + r"(?:\s|$)",
+                re.MULTILINE,
+            )
+            m = pattern.search(text)
+            if m:
+                start = m.start()
+                break
+        except re.error:
+            continue
+    if start < 0:
+        return False
+
+    rest = text[start:]
+    # 找下一个 ## header (跳过本 header)
+    next_header = re.search(r"\n##\s+[^#\n]", rest[3:])
+    body = rest[: next_header.start() + 3] if next_header else rest
+    # 去掉 header 本行
+    body_content = re.sub(r"^##[^\n]*\n", "", body, count=1).strip()
+
+    if len(body_content) < min_body_len:
+        return False
+
+    # 必须至少 1 个 F<id> cite
+    if not re.search(r"\bF\d{3,}\b", body_content):
+        return False
+
+    return True
+
+
+def check_transcript_for_file_edit(transcript_path, target_file):
+    """
+    本回合是否有 Edit / Write / MultiEdit / NotebookEdit tool_use 且 file_path 命中 target_file.
+
+    target_file 是相对项目根的路径 (例如 ".claude/state/dead_ends.md").
+    命中判定: tool_use.input.file_path 末尾匹配 target_file (兼容绝对路径 / 正反斜杠).
+
+    结构照抄 check_transcript_for_python_bash 的 walker.
+    """
+    if not transcript_path or not target_file:
+        return False
+    p = Path(transcript_path)
+    if not p.exists():
+        return False
+
+    # 规范化 target_file: 用正斜杠 + 小写比较 (Windows 不区分大小写)
+    target_norm = target_file.replace("\\", "/").lower()
+    # 允许 target 是相对路径 (以 / 结尾比较更安全, 防 foo.md 误匹配 bar/foo.md 不是问题,
+    # 但反过来 dead_ends.md 匹配 new_dead_ends.md 会出事). 用 "以 target 结尾 + 前一字符是 /
+    # 或是字符串起点" 判定.
+
+    def matches(file_path):
+        if not file_path:
+            return False
+        fp = str(file_path).replace("\\", "/").lower()
+        if not fp.endswith(target_norm):
+            return False
+        prefix_len = len(fp) - len(target_norm)
+        if prefix_len == 0:
+            return True
+        return fp[prefix_len - 1] == "/"
+
+    try:
+        file_size = p.stat().st_size
+        if file_size > 512 * 1024:
+            with p.open("rb") as f:
+                f.seek(-512 * 1024, 2)
+                f.readline()
+                raw = f.read()
+            text = raw.decode("utf-8", errors="ignore")
+        else:
+            text = p.read_text(encoding="utf-8")
+    except Exception as e:
+        log("L7 failed to read transcript: {0}".format(e), HOOK_NAME)
+        return False
+
+    edit_tool_names = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+
+        role = event.get("role") or event.get("type") or ""
+        inner = event.get("message")
+        if isinstance(inner, dict) and not role:
+            role = inner.get("role") or inner.get("type") or ""
+        if role in ("user", "human"):
+            break
+
+        content = event.get("content")
+        if content is None and isinstance(inner, dict):
+            content = inner.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "tool_use":
+                continue
+            name = str(item.get("name", "") or "")
+            if name not in edit_tool_names:
+                continue
+            input_obj = item.get("input", {}) or {}
+            if not isinstance(input_obj, dict):
+                continue
+            file_path = input_obj.get("file_path", "") or input_obj.get("path", "")
+            if matches(file_path):
+                return True
+            # MultiEdit 可能把文件路径放在 edits 列表内, 但 file_path 仍是顶层字段,
+            # 官方 MultiEdit schema 就是 file_path + edits, 上面的检查已覆盖.
+
+    return False
+
+
+# ============================================================
+# L8: 禁止 AI 自发停止
+# ============================================================
+
+
+def check_l8_self_stop(text, transcript_path, config):
+    """
+    L8: 回复含"自发停止"短语, 但任务未完成 / 未暂停 / 用户未主动停止 → block.
+
+    通过条件 (任一):
+    1. plan.md frontmatter status == "completed"
+    2. plan.md frontmatter paused == true
+    3. 本回合最后一条 user message 含 user_pause_phrases 任一
+    4. 回复含 user-told: cite
+
+    豁免: 回复中含 exemption_phrases (等你 / 等触发 / 请触发 / ...) 视为合法等待 handoff,
+         不算自发停止. 这是协作中正常的 "AI 等用户操作" 模式.
+
+    代码块 / 行内 code / `>` 引用行也豁免 (避免引用用户原话误伤).
+    """
+    check_config = config.get("self_stop_check") or {}
+    if not isinstance(check_config, dict):
+        return True, None
+    if not check_config.get("enabled", True):
+        return True, None
+
+    triggers = check_config.get("trigger_phrases") or []
+    user_pause_phrases = check_config.get("user_pause_phrases") or []
+    exemption_phrases = check_config.get("exemption_phrases") or []
+
+    if not triggers:
+        return True, None
+
+    stripped = strip_code_blocks(text)
+    # 去引用行
+    cleaned_lines = [
+        ln for ln in stripped.split("\n") if not ln.strip().startswith(">")
+    ]
+    cleaned = "\n".join(cleaned_lines)
+
+    # handoff 豁免: 回复中含等待用户操作的句式 → 直接放行
+    for phrase in exemption_phrases:
+        if phrase and phrase in cleaned:
+            return True, None
+
+    # 找触发词
+    triggered = []
+    for pat in triggers:
+        if not pat:
+            continue
+        try:
+            m = re.search(pat, cleaned, re.UNICODE)
+            if m:
+                triggered.append((pat, m.group(0)))
+        except re.error as e:
+            log("L8 regex compile error for `{0}`: {1}".format(pat, e), HOOK_NAME)
+            continue
+
+    if not triggered:
+        return True, None
+
+    # 通过条件 1+2: 检查 plan.md frontmatter
+    from _lib import plan_path, load_state_file
+
+    plan_fm, _ = load_state_file(plan_path())
+    plan_status = str(plan_fm.get("status", "") or "").strip().lower()
+    plan_paused = plan_fm.get("paused", False)
+
+    if plan_status == "completed":
+        return True, None
+    if plan_paused is True:
+        return True, None
+
+    # 通过条件 3: 本回合最后一条 user message 含暂停指示
+    if user_pause_phrases:
+        last_user_msg = _get_last_user_message_text(transcript_path)
+        if last_user_msg:
+            last_user_lower = last_user_msg.lower()
+            for phrase in user_pause_phrases:
+                if phrase and phrase.lower() in last_user_lower:
+                    return True, None
+
+    # 通过条件 4: user-told cite
+    if re.search(r"user-told\s*:", stripped, re.IGNORECASE):
+        return True, None
+
+    sample = "\n".join(
+        "  - pattern `{0}` -> match `{1}`".format(p, str(m)[:60])
+        for p, m in triggered[:3]
+    )
+    return False, (
+        "**Stop hook L8 violation**: 回复含自发停止意图, 但任务未完成且用户未授权暂停.\n\n"
+        "**命中的停止短语**:\n{0}\n\n"
+        "**当前状态**:\n"
+        "- plan.md `status`: `{1}` (需要 `completed`)\n"
+        "- plan.md `paused`: `{2}` (需要 `true`)\n\n"
+        "**为什么 block**: 任务还没完成, AI 不允许自发 '休息 / 暂停 / 改天再做'. "
+        "AI 必须工作到任务真正完成, 或者由**用户**通过 /pauseAnalysis (或显式说 '休息一下' / '暂停' / '今天先到这') 主动暂停.\n\n"
+        "**修复 (任选其一)**:\n\n"
+        "(a) **继续工作**: 删掉停止类语句, 继续执行当前 step. 任务没完成就不停.\n\n"
+        "(b) **如果是 handoff 等待**: 不要用 '休息 / 暂停 / 改天再' 等词. 改成明确的"
+        "等待句式 (这些是 L8 豁免词):\n"
+        "  - `等你触发后告诉我`\n"
+        "  - `请去做 X 后回复`\n"
+        "  - `等你确认 Y`\n"
+        "  - `请运行 Z 并把结果贴给我`\n\n"
+        "(c) **如果是用户让你停**: 在回复里 cite `user-told: <用户原话>`, 例如 "
+        "`user-told: 用户说 '今天先到这, 明天继续'`.\n\n"
+        "(d) **如果你判断任务真的完成了**: 改 plan.md 的 frontmatter `status: completed`, "
+        "在回复中加 `## 自证` 段 (L5 会要求, 含结论 / 依据 F<id> / 自我检查 4 项), 才能说 '完成'.\n\n"
+        "**正确的 handoff 示例 (L8 通过)**:\n"
+        "  > 我已设好 bp 在 0x... (F012). 请去启动游戏并触发战斗一次. 触发后回复我, 我读 bp 输出继续分析.\n\n"
+        "**错误的自发停止示例 (L8 block)**:\n"
+        "  > 当前进度告一段落, 我先休息一下, 等你有空我们再继续.\n\n"
+        "如果用户真的想暂停, 应该使用 `/pauseAnalysis` slash command, 它会触发完整的快照流程."
+    ).format(sample, plan_status or "(空)", plan_paused)
+
+
+def _get_last_user_message_text(transcript_path):
+    """
+    从 transcript 读最后一条 user message 的纯文本.
+
+    不区分 tool_result vs 真实 user input — 都视作 user 内容. 因为我们要找用户最近说了什么,
+    tool_result 不含暂停意图, 真实 user input 才会含, 所以扫文本 substring 即可.
+
+    只读最后 256 KB 提速.
+    """
+    if not transcript_path:
+        return ""
+    p = Path(transcript_path)
+    if not p.exists():
+        return ""
+
+    try:
+        file_size = p.stat().st_size
+        if file_size > 256 * 1024:
+            with p.open("rb") as f:
+                f.seek(-256 * 1024, 2)
+                f.readline()
+                raw = f.read()
+            text = raw.decode("utf-8", errors="ignore")
+        else:
+            text = p.read_text(encoding="utf-8")
+    except Exception as e:
+        log("L8 failed to read transcript: {0}".format(e), HOOK_NAME)
+        return ""
+
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    # 倒序找最后一条 user message (跳过 tool_result events)
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(event, dict):
+            continue
+
+        role = event.get("role") or event.get("type") or ""
+        inner = event.get("message")
+        if isinstance(inner, dict) and not role:
+            role = inner.get("role") or inner.get("type") or ""
+        if role not in ("user", "human"):
+            continue
+
+        # 提取 content. 跳过 tool_result-only 消息.
+        content = event.get("content")
+        if content is None and isinstance(inner, dict):
+            content = inner.get("content")
+
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                # 只收集 text 类型, 跳过 tool_result
+                if item.get("type") == "text":
+                    text_parts.append(str(item.get("text", "") or ""))
+                elif "text" in item and isinstance(item["text"], str):
+                    text_parts.append(item["text"])
+            if text_parts:
+                return "\n".join(text_parts)
+
+    return ""
 
 
 # ============================================================

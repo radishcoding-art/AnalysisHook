@@ -43,6 +43,70 @@ tool_allowlists:
     - mcp__CheatEngine__search_string
     - mcp__CheatEngine__get_scan_results
 
+  # IDA Pro MCP - 静态分析 dump, 只读查询 + IDB 标注
+  mcp__IDAProMCP__:
+    # 函数 / 全局 / 导入 列表
+    - mcp__IDAProMCP__list_funcs
+    - mcp__IDAProMCP__lookup_funcs
+    - mcp__IDAProMCP__export_funcs
+    - mcp__IDAProMCP__list_globals
+    - mcp__IDAProMCP__imports
+    # 反汇编 / 反编译 / 基本块 / 调用关系
+    - mcp__IDAProMCP__disasm
+    - mcp__IDAProMCP__decompile
+    - mcp__IDAProMCP__basic_blocks
+    - mcp__IDAProMCP__callees
+    - mcp__IDAProMCP__callgraph
+    - mcp__IDAProMCP__xrefs_to
+    - mcp__IDAProMCP__xrefs_to_field
+    # 内存 / 字节 / 字符串 / 整数读取
+    - mcp__IDAProMCP__get_bytes
+    - mcp__IDAProMCP__get_string
+    - mcp__IDAProMCP__get_int
+    - mcp__IDAProMCP__get_global_value
+    - mcp__IDAProMCP__int_convert
+    # 搜索
+    - mcp__IDAProMCP__find
+    - mcp__IDAProMCP__find_bytes
+    - mcp__IDAProMCP__find_regex
+    # 结构体 / 栈帧分析 (只读)
+    - mcp__IDAProMCP__read_struct
+    - mcp__IDAProMCP__search_structs
+    - mcp__IDAProMCP__stack_frame
+    - mcp__IDAProMCP__infer_types
+    # IDB 标注 (改的是 IDA 数据库, 不是二进制本身, 用于沉淀分析结论)
+    - mcp__IDAProMCP__rename
+    - mcp__IDAProMCP__set_comments
+    - mcp__IDAProMCP__set_type
+    - mcp__IDAProMCP__declare_type
+    - mcp__IDAProMCP__declare_stack
+    - mcp__IDAProMCP__delete_stack
+
+  # x64dbg MCP - 唯一动态调试器, 断点 / 单步 / 寄存器 / 栈回溯
+  mcp__x64dbg__:
+    # 表达式 / 符号 / 标签
+    - mcp__x64dbg__DbgValFromString
+    - mcp__x64dbg__GetLabel
+    - mcp__x64dbg__CommentOrLabelAtAddress
+    # 反汇编 / 内存查询
+    - mcp__x64dbg__ReadDismAtAddress
+    - mcp__x64dbg__GetAllModulesFromMemMap
+    # 线程 / 寄存器 / 栈
+    - mcp__x64dbg__GetAllActiveThreads
+    - mcp__x64dbg__GetAllRegisters
+    - mcp__x64dbg__GetCallStack
+    # 断点查询
+    - mcp__x64dbg__GetBreakpointInfo
+    # 命令列表 (只读查文档)
+    - mcp__x64dbg__ListDebuggerCommands
+    # 打印
+    - mcp__x64dbg__Echo
+    # 命令执行 (bp / run / step / go 等, 这是 x64dbg 动态调试的主力入口)
+    - mcp__x64dbg__ExecuteDebuggerCommand
+    - mcp__x64dbg__ExecuteDebuggerCommandDirect
+    - mcp__x64dbg__ExecuteDebuggerCommandWithOutput
+    - mcp__x64dbg__ExecuteDebuggerCommandWithVar
+
 # 显式禁止列表 (供文档说明, hook 实际由 deny_unless_allowlisted 强制).
 # 这个列表不被 hook 直接使用, 但展示哪些工具是被 deny 的, 让人看清规则.
 tool_denylists_explicit:

@@ -114,9 +114,35 @@ def main():
     parts.append("4. 任何 tool call 前比对 dead_ends.md, 已证伪的方向不允许重试.")
     parts.append("5. 用户告知的事实写到 facts.md source: user, **不允许反向质疑**.")
     parts.append(
-        "6. **结论声明必须自证 + 独立审查** (Stop hook L5): 回复含 '结论' / '已完成' / '已验证' / '最终' 等触发词 → "
-        "必须含 `## 自证与审查` 段 + 用 Agent 工具调用 `superpowers:code-reviewer` 做独立审查. "
-        "reviewer 若说 not-passed, 必须修复后再审 (最多 3 轮). 详细见 CLAUDE.md."
+        "6. **计算强制 (Stop hook L6 会 block)**: 涉及数字运算 (加减乘除 / 位运算 / 地址偏移 / "
+        '字节长度 / 进制转换 / 百分比 / 时间换算) 一律用 `Bash(python -c "...")` 执行, '
+        "把 python 输出贴回回复, 再写结论. 禁止心算 / 手算. "
+        "L6 会扫回复的算术表达式 + 结果声明词, 无 python Bash 即 block. "
+        "误报豁免: 数字放进代码块 / 行内 code / `>` 引用行."
+    )
+    parts.append(
+        "7. **结论声明必须自证** (Stop hook L5): 回复含 '结论' / '已完成' / '已验证' / '最终' 等触发词 → "
+        "必须含 `## 自证` (或 `## 自证与审查`) 段, 正文 >= 100 字符, 含三段: "
+        "**结论** (一句话) / **依据** (cite F<id>) / **自我检查** (上下文偏见 / sunk cost / 逻辑漏洞 / 确认偏见 4 项). "
+        "**不要求**外部 reviewer 调用 (require_reviewer_call=false). 详细格式见 CLAUDE.md '结论自证 (L5 检查)' 章节."
+    )
+    parts.append(
+        "8. **禁止未证伪就切换方向 (Stop hook L7 会 block)**: 想放弃当前方案换新方向前, 必须有证据. "
+        "触发词: '改走' / '换思路' / '另辟' / '放弃当前' / '重新规划' / '绕过' / '像 F<id> 一样' 等. "
+        "通过条件 (任一): (a) 本回合 Edit/Write 了 `.claude/state/dead_ends.md` 登记当前路径为死胡同; "
+        "(b) 回复含 `## 方案切换评估` 段, 正文 >= 100 字符含 F<id> cite, 写明当前方案 / 已验证 / 剩余步骤 / "
+        "不可行理由 / 新方向; (c) cite `user-told:` 表明用户授权. "
+        "**禁止理由**: '挖了太多层' / '太复杂' / '感觉不对' / 纯类比 (F<id> 一样) 都不算证据. "
+        "豁免: 头脑风暴 / 讨论多方案时句首加 '头脑风暴' / '讨论' / '考虑' 等前缀."
+    )
+    parts.append(
+        "9. **禁止 AI 自发停止 (Stop hook L8 会 block)**: 任务未完成前, 不允许说 '休息 / 暂停 / 改天再 / "
+        "今天先到这 / 我累了 / 稍后继续' 等自发停止类语句. "
+        "通过条件 (任一): (a) plan.md `status: completed`; (b) plan.md `paused: true` (用户已通过 /pauseAnalysis 设置); "
+        "(c) 本回合用户 message 含暂停指示词 (休息 / 暂停 / 先到这 / ...); (d) cite `user-told:` 引用用户暂停指令. "
+        "**协作 handoff 豁免**: 用 '等你触发后告诉我' / '请去做 X 后回复' / '等你确认' / '请运行 ...' 等 "
+        "明确的等待句式, L8 自动放行. 这是合法的等用户操作, 不算自发停止. "
+        "**用户主动暂停**: 用户应该通过 `/pauseAnalysis` slash command, AI 不允许自己改 paused 字段."
     )
     parts.append("---")
 

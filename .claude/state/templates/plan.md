@@ -8,6 +8,10 @@ status: empty # empty | active | completed | blocked
 current_step: null # 字符串 (S001 / S002 ...), null 表示无 active step
 last_id: 0 # 自动递增 step id, 永不复用
 steps: []
+# 暂停状态 (由 /pauseAnalysis 设置, /resumeAnalysis 清除). Stop hook L8 用此字段判断 "AI 自停止" 是否合法.
+paused: false # true 时 L8 允许停止类回复. 必须由用户通过 /pauseAnalysis 设置, AI 不允许擅自改.
+paused_at: null # ISO 8601 时间戳, /pauseAnalysis 设置
+pause_snapshot: null # 暂停快照文件名 (.claude/state/snapshots/<timestamp>.md), /pauseAnalysis 设置, /resumeAnalysis 必须读
 ---
 
 # 当前 plan

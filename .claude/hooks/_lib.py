@@ -287,6 +287,48 @@ def load_state_file(path):
     return split_frontmatter(content)
 
 
+def set_yaml_frontmatter_field(content, field, new_value_repr):
+    """
+    简单 in-place 改 frontmatter 字段值 (regex 路线).
+
+    用 PyYAML 重新 dump 会丢注释和顺序, 所以这里走 regex.
+    如果字段存在 → 替换其值. 不存在 → 在 frontmatter 末尾追加.
+
+    new_value_repr 必须是已格式化的 yaml 值字符串, 例如 'true' / '"abc"' / 'null' / '42'.
+    调用方负责 quote 字符串值.
+
+    用于 pause_analysis / resume_analysis 等需要原子改 plan.md frontmatter 的场景.
+    """
+    import re
+
+    if not content.startswith("---"):
+        return "---\n{0}: {1}\n---\n{2}".format(field, new_value_repr, content)
+
+    # 找 frontmatter 边界
+    end_match = re.search(r"\n---\s*\n", content[3:])
+    if not end_match:
+        return content
+    fm_start = 4  # "---\n" 后
+    fm_end = 3 + end_match.start()  # 第二个 "---" 前
+    fm_text = content[fm_start:fm_end]
+    body = content[3 + end_match.end() - 1 :]
+
+    # 替换或追加字段
+    pattern = re.compile(
+        r"^(\s*" + re.escape(field) + r"\s*:\s*)([^\n#]*)(.*)$",
+        re.MULTILINE,
+    )
+    m = pattern.search(fm_text)
+    if m:
+        new_fm = pattern.sub(
+            lambda mm: mm.group(1) + new_value_repr + mm.group(3), fm_text, count=1
+        )
+    else:
+        new_fm = fm_text.rstrip("\n") + "\n{0}: {1}\n".format(field, new_value_repr)
+
+    return "---\n" + new_fm + "\n---\n" + body.lstrip("\n")
+
+
 # ============================================================
 # 输出辅助
 # ============================================================
